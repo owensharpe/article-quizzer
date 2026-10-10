@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Article Quizzer Settings</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body class="options-page">
+    <main>
+      <header class="page-masthead">
+        <img src="icons/icon.svg" alt="" width="52" height="52" />
+        <div>
+          <h1>Article Quizzer</h1>
+          <p class="standfirst">Comprehension quizzes for what you read.</p>
+        </div>
+      </header>
+
+      <section class="section">
+        <div class="kicker">How it works</div>
+        <ol class="prose">
+          <li>Open an article or a PDF.</li>
+          <li>
+            Click the Article Quizzer icon in the toolbar, press <kbd id="shortcut">Alt+Shift+Q</kbd>, or
+            right-click the page and choose <em>Create a quiz from this page</em>. Pin the icon from Chrome's
+            extensions menu to keep it in reach.
+          </li>
+          <li>
+            Answer the questions. Each answer includes an explanation and the passage it is based on;
+            <em>Show in article</em> highlights that passage on the page.
+          </li>
+          <li>Return when a quiz is due for review. Spaced retakes are what make reading stay with you.</li>
+        </ol>
+        <div>
+          <button id="shortcut-btn" class="link-btn" type="button">Change the keyboard shortcut</button>
+        </div>
+      </section>
+
+      <section class="section">
+        <h2>Gemini API key</h2>
+        <p class="prose">
+          Quizzes are written by Google's Gemini. Keys are free:
+          <a href="https://aistudio.google.com/apikey" target="_blank" rel="noopener"
+            >create one in Google AI Studio</a
+          >, then paste it below.
+        </p>
+        <form id="key-form" class="key-form">
+          <input
+            id="api-key"
+            class="input"
+            type="password"
+            placeholder="Gemini API key"
+            autocomplete="off"
+            spellcheck="false"
+            aria-label="Gemini API key"
+          />
+          <button id="toggle-key" class="btn" type="button">Show</button>
+          <button class="btn primary" type="submit">Save</button>
+        </form>
+        <p id="key-status" class="status" role="status"></p>
+      </section>
+
+      <section class="section">
+        <h2>Model</h2>
+        <div id="model-list" class="model-list"></div>
+        <p id="model-status" class="status" role="status"></p>
+      </section>
+
+      <section class="section">
+        <h2>Privacy</h2>
+        <p class="prose">
+          Article Quizzer has no server and collects nothing. It reads a page only after you invoke it there,
+          and if the tab moves to another page, it waits until you invoke it again. When you begin a quiz, the
+          article's text goes directly from your browser to Google's Gemini API. So do your written answers,
+          with the passage behind each question, when they are graded, and the text around an answer when you
+          select <em>Explain more</em>. Your key, settings, and quiz history stay in this browser.
+        </p>
+        <p class="prose">
+          On Gemini's free tier, Google may use what you send to improve its products. Avoid quizzing yourself
+          on confidential documents with a free key.
+        </p>
+      </section>
+
+      <section class="section">
+        <h2>Quiz history</h2>
+        <p id="history-count" class="prose"></p>
+        <div>
+          <button id="clear-history" class="btn" type="button">Clear history</button>
+        </div>
+      </section>
+    </main>
+    <script type="module" src="options.js"></script>
+  </body>
+</html>

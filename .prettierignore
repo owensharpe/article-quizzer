@@ -1,0 +1,5 @@
+extension/vendor/
+dist/
+store/
+package-lock.json
+*.md
