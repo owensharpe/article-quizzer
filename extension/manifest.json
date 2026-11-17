@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Article Quizzer",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Comprehension quizzes for the articles and PDFs you read, with explanations and the source passage for every answer.",
   "minimum_chrome_version": "116",
   "icons": {

@@ -3,20 +3,25 @@
 import { cleanModelId } from './storage.js';
 
 const API_ROOT = 'https://generativelanguage.googleapis.com/v1beta';
-// Overloads usually clear within seconds. A timeout (504) mostly comes from a
-// long input, so resending the same request wouldn't help.
-const TRANSIENT_STATUSES = new Set([500, 502, 503]);
-const RETRY_DELAYS = [1500, 4000];
+// An overloaded model can leave a request hanging for minutes, while another
+// model may answer in seconds. Files such as PDFs take longer to read.
+const TIME_LIMIT_MS = 45_000;
+const FILE_TIME_LIMIT_MS = 120_000;
 
-// detail holds what Gemini itself said, for showing in small print.
+// detail holds what Gemini itself said, for showing in small print. timedOut
+// marks a request that got no reply within the time limit.
 export class AIError extends Error {
-  constructor(message, { code = 'unknown', status = 0, retryAfterSec = null, detail = '' } = {}) {
+  constructor(
+    message,
+    { code = 'unknown', status = 0, retryAfterSec = null, detail = '', timedOut = false } = {},
+  ) {
     super(message);
     this.name = 'AIError';
     this.code = code;
     this.status = status;
     this.retryAfterSec = retryAfterSec;
     this.detail = detail;
+    this.timedOut = timedOut;
   }
 }
 
@@ -38,14 +43,21 @@ export function buildRequestBody({ system, prompt, schema, thinkingLevel, attach
   };
 }
 
+export function timeLimit(attachments = []) {
+  return attachments.length ? FILE_TIME_LIMIT_MS : TIME_LIMIT_MS;
+}
+
+// Overloads aren't retried here, since the caller may do better with another
+// model first. timeoutMs limits each request.
 export async function generateJSON({
   apiKey,
   model,
   system,
   prompt,
   schema,
-  attachments,
+  attachments = [],
   signal,
+  timeoutMs = timeLimit(attachments),
   fetchImpl = fetch,
 }) {
   const key = cleanKey(apiKey);
@@ -54,29 +66,17 @@ export async function generateJSON({
   if (!modelId) throw new AIError('Choose a Gemini model in Settings.', { code: 'bad_model' });
 
   const url = `${API_ROOT}/models/${encodeURIComponent(modelId)}:generateContent`;
+  const attempt = (thinkingLevel) => {
+    const body = buildRequestBody({ system, prompt, schema, attachments, thinkingLevel });
+    return send(fetchImpl, url, key, body, withTimeLimit(signal, timeoutMs)).catch((err) => {
+      throw err?.name === 'TimeoutError' ? timeoutError(modelId, timeoutMs) : err;
+    });
+  };
   // Low thinking keeps quizzes fast; the questions come straight from the text.
-  let body = buildRequestBody({
-    system,
-    prompt,
-    schema,
-    attachments,
-    thinkingLevel: acceptsThinkingLevel(modelId) ? 'low' : null,
-  });
-  let retries = 0;
-  let res;
-  while (true) {
-    res = await send(fetchImpl, url, key, body, signal);
-    if (
-      res.status === 400 &&
-      body.generationConfig.thinkingConfig &&
-      /thinking/i.test(errorMessage(res.data))
-    ) {
-      body = buildRequestBody({ system, prompt, schema, attachments, thinkingLevel: null });
-    } else if (TRANSIENT_STATUSES.has(res.status) && retries < RETRY_DELAYS.length) {
-      await delay(RETRY_DELAYS[retries++], signal);
-    } else {
-      break;
-    }
+  const thinkingLevel = acceptsThinkingLevel(modelId) ? 'low' : null;
+  let res = await attempt(thinkingLevel);
+  if (res.status === 400 && thinkingLevel && /thinking/i.test(errorMessage(res.data))) {
+    res = await attempt(null);
   }
   if (!res.ok) throw toAIError(res.status, res.data, modelId);
   return parseGenerateResponse(res.data);
@@ -120,15 +120,42 @@ async function send(fetchImpl, url, apiKey, body, signal) {
       signal,
     });
   } catch (err) {
-    if (err?.name === 'AbortError') throw err;
+    if (stopped(err)) throw err;
     throw networkError();
   }
-  // A cancel can also land while the body is still arriving.
+  // A cancel or the time limit can also land while the body is still arriving.
   const data = await res.json().catch((err) => {
-    if (err?.name === 'AbortError') throw err;
+    if (stopped(err)) throw err;
     return null;
   });
   return { ok: res.ok, status: res.status, data };
+}
+
+// Aborts when the caller cancels or the time runs out, whichever comes first.
+function withTimeLimit(signal, ms) {
+  const timeout = AbortSignal.timeout(ms);
+  if (!signal) return timeout;
+  if (AbortSignal.any) return AbortSignal.any([signal, timeout]);
+  const controller = new AbortController();
+  for (const source of [signal, timeout]) {
+    if (source.aborted) controller.abort(source.reason);
+    else source.addEventListener('abort', () => controller.abort(source.reason), { once: true });
+  }
+  return controller.signal;
+}
+
+// Cancelled or out of time, as opposed to failing on its own.
+function stopped(err) {
+  return err?.name === 'AbortError' || err?.name === 'TimeoutError';
+}
+
+// Counts as a busy model, so the next model gets a turn.
+function timeoutError(modelId, ms) {
+  return new AIError('Gemini took too long to answer. Try again in a moment.', {
+    code: 'server',
+    detail: `No response from ${modelId} within ${Math.round(ms / 1000)} seconds`,
+    timedOut: true,
+  });
 }
 
 // Keys copied from a web page or document can pick up invisible characters,
@@ -258,22 +285,4 @@ function humanize(enumValue) {
 
 function networkError() {
   return new AIError("Couldn't reach Gemini. Check your internet connection.", { code: 'network' });
-}
-
-function delay(ms, signal) {
-  return new Promise((resolve, reject) => {
-    if (signal?.aborted) {
-      reject(signal.reason);
-      return;
-    }
-    const onAbort = () => {
-      clearTimeout(timer);
-      reject(signal.reason);
-    };
-    const timer = setTimeout(() => {
-      signal?.removeEventListener('abort', onAbort);
-      resolve();
-    }, ms);
-    signal?.addEventListener('abort', onAbort, { once: true });
-  });
 }

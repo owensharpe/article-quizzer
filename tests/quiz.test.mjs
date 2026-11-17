@@ -1,5 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { getEventListeners } from 'node:events';
 import {
   normalizeQuiz,
   reshuffleQuestion,
@@ -254,6 +255,14 @@ const overloaded = () => ({
   status: 503,
   json: async () => ({ error: { code: 503, status: 'UNAVAILABLE', message: 'The model is overloaded.' } }),
 });
+const notFound = () => ({ ok: false, status: 404, json: async () => ({ error: { message: 'Not found' } }) });
+const rateLimited = () => ({
+  ok: false,
+  status: 429,
+  json: async () => ({ error: { code: 429, message: 'Resource exhausted' } }),
+});
+// What fetch throws when the request's time limit runs out.
+const timedOut = () => new DOMException('The operation timed out.', 'TimeoutError');
 const modelOf = (url) => /models\/([^:]+):/.exec(url)[1];
 const quizArgs = (model) => ({
   article: meta,
@@ -362,28 +371,27 @@ test('explainMore returns the explanation text', async (t) => {
   await assert.rejects(explainMore({ question: q, answer: {}, settings }), { code: 'empty' });
 });
 
-// Retries wait a few seconds between attempts; skip the waiting in tests.
+// Skips the waits between passes, but moves the clock on as if they had passed.
+// Without jitter, the waits are exactly 2, 5, then 10 seconds.
 function skipDelays(t) {
-  t.mock.method(globalThis, 'setTimeout', (fn) => {
+  let now = Date.now();
+  t.mock.method(Date, 'now', () => now);
+  t.mock.method(Math, 'random', () => 0.5);
+  t.mock.method(globalThis, 'setTimeout', (fn, ms) => {
+    now += ms;
     queueMicrotask(fn);
     return 0;
   });
 }
 
-test('generateQuiz switches to another model when the chosen one stays overloaded', async (t) => {
-  skipDelays(t);
+test('generateQuiz moves straight to a backup when the chosen model is overloaded', async (t) => {
   const models = [];
   t.mock.method(globalThis, 'fetch', async (url) => {
     models.push(modelOf(url));
     return modelOf(url) === 'gemini-3.8-flash' ? overloaded() : quizReply();
   });
   const quiz = await generateQuiz(quizArgs('gemini-3.8-flash'));
-  assert.deepEqual(models, [
-    'gemini-3.8-flash',
-    'gemini-3.8-flash',
-    'gemini-3.8-flash',
-    'gemini-3.5-flash-lite',
-  ]);
+  assert.deepEqual(models, ['gemini-3.8-flash', 'gemini-3.5-flash-lite']);
   assert.equal(quiz.model, 'gemini-3.5-flash-lite');
   assert.equal(quiz.fallbackReason, 'server');
   assert.equal(quiz.scope, 'article');
@@ -401,37 +409,172 @@ test('generateQuiz switches models when the chosen one is no longer available', 
     };
   });
   const quiz = await generateQuiz(quizArgs('gemini-2.0-flash'));
-  assert.deepEqual(models, ['gemini-2.0-flash', 'gemini-3.5-flash-lite']);
-  assert.equal(quiz.model, 'gemini-3.5-flash-lite');
+  assert.deepEqual(models, ['gemini-2.0-flash', 'gemini-3.8-flash']);
+  assert.equal(quiz.model, 'gemini-3.8-flash');
   assert.equal(quiz.fallbackReason, 'bad_model');
 });
 
-test("generateQuiz reports the chosen model's error when the other model fails too", async (t) => {
+test('generateQuiz switches models when the chosen one is out of free-tier quota', async (t) => {
+  const models = [];
+  t.mock.method(globalThis, 'fetch', async (url) => {
+    models.push(modelOf(url));
+    return modelOf(url) === 'gemini-3.5-flash-lite' ? rateLimited() : quizReply();
+  });
+  const quiz = await generateQuiz(quizArgs('gemini-3.5-flash-lite'));
+  assert.deepEqual(models, ['gemini-3.5-flash-lite', 'gemini-3.8-flash'], 'a rate limit is not retried');
+  assert.equal(quiz.model, 'gemini-3.8-flash');
+  assert.equal(quiz.fallbackReason, 'rate_limit');
+});
+
+test('generateQuiz gives a third model a chance when the first backup fails too', async (t) => {
+  const models = [];
+  const statuses = [];
+  t.mock.method(globalThis, 'fetch', async (url) => {
+    models.push(modelOf(url));
+    if (modelOf(url) === 'gemini-3.8-flash') return overloaded();
+    if (modelOf(url) === 'gemini-3.5-flash-lite') throw timedOut();
+    return quizReply();
+  });
+  const quiz = await generateQuiz({ ...quizArgs('gemini-3.8-flash'), onStatus: (s) => statuses.push(s) });
+  assert.deepEqual(models, ['gemini-3.8-flash', 'gemini-3.5-flash-lite', 'gemini-3.6-flash']);
+  assert.deepEqual(statuses, [
+    { model: 'gemini-3.8-flash', reason: 'busy', next: 'gemini-3.5-flash-lite' },
+    { model: 'gemini-3.5-flash-lite', reason: 'slow', next: 'gemini-3.6-flash' },
+  ]);
+  assert.equal(quiz.model, 'gemini-3.6-flash');
+  assert.equal(quiz.fallbackReason, 'server');
+});
+
+test('generateQuiz stops at a backup error that another model would not fix', async (t) => {
+  const models = [];
+  t.mock.method(globalThis, 'fetch', async (url) => {
+    models.push(modelOf(url));
+    if (modelOf(url) === 'gemini-3.8-flash') throw timedOut();
+    return { ok: true, status: 200, json: async () => ({ promptFeedback: { blockReason: 'OTHER' } }) };
+  });
+  await assert.rejects(generateQuiz(quizArgs('gemini-3.8-flash')), (err) => {
+    assert.equal(err.code, 'server');
+    assert.match(err.message, /took too long/);
+    assert.equal(
+      err.detail,
+      'No response from gemini-3.8-flash within 45 seconds · ' +
+        "Fallback model gemini-3.5-flash-lite: Gemini wouldn't process this text (other).",
+    );
+    return true;
+  });
+  assert.deepEqual(models, ['gemini-3.8-flash', 'gemini-3.5-flash-lite']);
+});
+
+test('generateQuiz pauses once every model has failed, then tries the busy ones again', async (t) => {
   skipDelays(t);
-  const notFound = { ok: false, status: 404, json: async () => ({ error: { message: 'Not found' } }) };
-  t.mock.method(globalThis, 'fetch', async (url) =>
-    modelOf(url) === 'gemini-2.0-flash' ? notFound : overloaded(),
+  const replies = {
+    'gemini-3.8-flash': [overloaded(), quizReply()],
+    'gemini-3.5-flash-lite': [rateLimited()],
+    'gemini-3.6-flash': [overloaded()],
+  };
+  const models = [];
+  t.mock.method(globalThis, 'fetch', async (url) => {
+    models.push(modelOf(url));
+    return replies[modelOf(url)].shift();
+  });
+  const statuses = [];
+  const controller = new AbortController();
+  const quiz = await generateQuiz({
+    ...quizArgs('gemini-3.8-flash'),
+    signal: controller.signal,
+    onStatus: (status) => statuses.push(status),
+  });
+  assert.deepEqual(
+    models,
+    ['gemini-3.8-flash', 'gemini-3.5-flash-lite', 'gemini-3.6-flash', 'gemini-3.8-flash'],
+    'a model out of quota sits out the next pass',
   );
-  await assert.rejects(generateQuiz(quizArgs('gemini-2.0-flash')), (err) => {
+  assert.deepEqual(statuses, [
+    { model: 'gemini-3.8-flash', reason: 'busy', next: 'gemini-3.5-flash-lite' },
+    { model: 'gemini-3.5-flash-lite', reason: 'quota', next: 'gemini-3.6-flash' },
+    { wait: 2 },
+    { next: 'gemini-3.8-flash' },
+  ]);
+  assert.equal(quiz.model, 'gemini-3.8-flash');
+  assert.equal(quiz.fallbackReason, undefined, 'the chosen model wrote it after all');
+  assert.equal(getEventListeners(controller.signal, 'abort').length, 0, 'the wait cleans up after itself');
+});
+
+test("generateQuiz keeps trying until its time runs out, then reports the chosen model's error", async (t) => {
+  skipDelays(t);
+  const started = Date.now();
+  const calls = [];
+  const statuses = [];
+  const limits = t.mock.method(AbortSignal, 'timeout');
+  t.mock.method(globalThis, 'fetch', async (url) => {
+    calls.push({ model: modelOf(url), at: Date.now() - started });
+    return modelOf(url) === 'gemini-2.0-flash' ? notFound() : overloaded();
+  });
+  const args = { ...quizArgs('gemini-2.0-flash'), onStatus: (status) => statuses.push(status) };
+  await assert.rejects(generateQuiz(args), (err) => {
     assert.equal(err.code, 'bad_model');
     assert.match(err.message, /"gemini-2\.0-flash" isn't available/);
     assert.equal(
       err.detail,
-      'Fallback model gemini-3.5-flash-lite: HTTP 503 · UNAVAILABLE · The model is overloaded.',
+      'Fallback model gemini-3.8-flash: HTTP 503 · UNAVAILABLE · The model is overloaded. · ' +
+        'Fallback model gemini-3.5-flash-lite: HTTP 503 · UNAVAILABLE · The model is overloaded.',
+      'each model once, however many tries',
     );
     return true;
   });
+  assert.deepEqual(statuses.slice(0, 5), [
+    { model: 'gemini-2.0-flash', reason: 'unavailable', next: 'gemini-3.8-flash' },
+    { model: 'gemini-3.8-flash', reason: 'busy', next: 'gemini-3.5-flash-lite' },
+    { wait: 2 },
+    { next: 'gemini-3.8-flash' },
+    { model: 'gemini-3.8-flash', reason: 'busy', next: 'gemini-3.5-flash-lite' },
+  ]);
+  assert.deepEqual(
+    statuses.filter((s) => s.wait).map((s) => s.wait),
+    [2, 5, 10, 10, 10, 10, 10, 10, 10],
+  );
+  assert.equal(calls.filter((c) => c.model === 'gemini-2.0-flash').length, 1, 'not retried once retired');
+  const last = calls.at(-1).at;
+  assert.ok(last > 60_000 && last < 90_000, `last try at ${last} ms`);
+  assert.equal(limits.mock.calls.at(-1).arguments[0], 90_000 - last, 'the last try gets only the time left');
+});
 
-  t.mock.restoreAll();
+test('generateQuiz gives a PDF more time before giving up', async (t) => {
+  skipDelays(t);
+  const started = Date.now();
+  let last = 0;
+  t.mock.method(globalThis, 'fetch', async () => {
+    last = Date.now() - started;
+    return overloaded();
+  });
+  await assert.rejects(generateQuiz({ ...quizArgs('gemini-3.8-flash'), pdfData: 'JVBERi0=' }), {
+    code: 'server',
+  });
+  assert.ok(last > 90_000 && last < 150_000, `last try at ${last} ms`);
+});
+
+test('generateQuiz stops as soon as it is cancelled, mid-request or between passes', async (t) => {
   t.mock.method(globalThis, 'fetch', async (url) => {
-    if (modelOf(url) === 'gemini-2.0-flash') return notFound;
+    if (modelOf(url) === 'gemini-2.0-flash') return notFound();
     throw new DOMException('The user aborted a request.', 'AbortError');
   });
   await assert.rejects(generateQuiz(quizArgs('gemini-2.0-flash')), { name: 'AbortError' });
+
+  t.mock.restoreAll();
+  t.mock.method(globalThis, 'setTimeout', () => 0); // the next pass would never come
+  const controller = new AbortController();
+  let calls = 0;
+  t.mock.method(globalThis, 'fetch', async () => {
+    if (++calls === 3) controller.abort();
+    return overloaded();
+  });
+  await assert.rejects(generateQuiz({ ...quizArgs('gemini-3.8-flash'), signal: controller.signal }), {
+    name: 'AbortError',
+  });
+  assert.equal(calls, 3);
 });
 
 test('generateQuiz retries a recitation stop on the model that hit it', async (t) => {
-  skipDelays(t);
   const calls = [];
   t.mock.method(globalThis, 'fetch', async (url, init) => {
     const shortQuotes = /under 15 words/.test(JSON.parse(init.body).contents[0].parts[0].text);
@@ -441,8 +584,6 @@ test('generateQuiz retries a recitation stop on the model that hit it', async (t
   });
   const quiz = await generateQuiz(quizArgs('gemini-3.8-flash'));
   assert.deepEqual(calls, [
-    'gemini-3.8-flash',
-    'gemini-3.8-flash',
     'gemini-3.8-flash',
     'gemini-3.5-flash-lite',
     'gemini-3.5-flash-lite, short quotes',

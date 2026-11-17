@@ -51,6 +51,18 @@ const VERDICTS = {
   partial: { icon: 'dash', label: 'Partially correct' },
   incorrect: { icon: 'close', label: 'Incorrect' },
 };
+// Why a model was passed over: on the loading screen, then in the note once a backup has written the quiz.
+const STATUS_REASONS = {
+  busy: 'is busy',
+  slow: 'is taking too long',
+  quota: 'hit its free-tier limit',
+  unavailable: "isn't available",
+};
+const FALLBACK_REASONS = {
+  server: 'was busy',
+  bad_model: "isn't available",
+  rate_limit: 'hit its free-tier limit',
+};
 const CHOICE_KEYS = { 1: 0, 2: 1, 3: 2, 4: 3, a: 0, b: 1, c: 2, d: 3 };
 const isMac = /Mac/i.test(navigator.userAgentData?.platform ?? navigator.platform);
 // Chinese, Japanese, and Thai don't put spaces between words.
@@ -65,7 +77,7 @@ const state = {
   useSelection: false,
   shortSelection: false, // asked to quiz a selection shorter than MIN_WORDS
   view: 'home', // home | generating | question | results | history
-  gen: null, // { controller, startedAt, words, title, note, avoid, error }
+  gen: null, // { controller, startedAt, words, title, note, status, avoid, error }
   run: null, // { quiz, order, pos, answers, kind: 'full' | 'missed' | 'review', finished, saved }
   pdf: null, // { url, data }: the last PDF read, so "New questions" doesn't download it again
   draft: '',
@@ -746,6 +758,7 @@ async function startQuiz(avoid = []) {
     words: quizWords(),
     title: article.title,
     note: NOTES[Math.floor(Math.random() * NOTES.length)],
+    status: `${modelLabel(settings.model)} is writing your quiz.`,
     avoid,
     error: null,
   };
@@ -762,6 +775,9 @@ async function startQuiz(avoid = []) {
       settings,
       avoid,
       signal: controller.signal,
+      onStatus: (status) => {
+        if (state.gen?.controller === controller) showStatus(status);
+      },
     });
     if (state.gen?.controller !== controller) return;
     state.gen = null;
@@ -773,7 +789,7 @@ async function startQuiz(avoid = []) {
       'full',
     );
     if (quiz.fallbackReason) {
-      const why = quiz.fallbackReason === 'bad_model' ? "isn't available" : 'was busy';
+      const why = FALLBACK_REASONS[quiz.fallbackReason];
       toast(`${modelLabel(settings.model)} ${why}, so ${modelLabel(quiz.model)} wrote this quiz.`);
     }
   } catch (err) {
@@ -840,6 +856,7 @@ function viewGenerating() {
       ' · ',
       h('span', { id: 'elapsed' }, elapsedText()),
     ),
+    h('p', { class: 'meta', id: 'gen-status', role: 'status' }, gen.status),
     h('p', { class: 'note' }, gen.note),
     h('div', {}, h('button', { class: 'btn', type: 'button', onclick: () => go('home') }, 'Cancel')),
   );
@@ -857,6 +874,19 @@ function elapsedText() {
 function tickElapsed() {
   const el = document.getElementById('elapsed');
   if (el) el.textContent = elapsedText();
+}
+
+// Updated in place, like the timer, so the loading bar's animation doesn't restart.
+function showStatus(status) {
+  state.gen.status = statusText(status);
+  const el = document.getElementById('gen-status');
+  if (el) el.textContent = state.gen.status;
+}
+
+function statusText({ model, reason, next, wait }) {
+  if (wait) return `All models are busy. Trying again in ${wait} seconds…`;
+  if (!model) return `${modelLabel(next)} is trying again.`;
+  return `${modelLabel(model)} ${STATUS_REASONS[reason]}, so ${modelLabel(next)} is trying.`;
 }
 
 function beginRun(quiz, order, kind) {

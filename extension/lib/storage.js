@@ -13,6 +13,7 @@ export const MODELS = [
   },
   { id: 'gemini-flash-latest', label: 'Gemini Flash (latest)', note: 'Always uses the newest Flash model.' },
 ];
+const BACKUP_MODELS = ['gemini-3.8-flash', 'gemini-3.5-flash-lite', 'gemini-3.6-flash'];
 
 // "models/gemini-x" and "gemini-x" name the same model.
 export function cleanModelId(model) {
@@ -21,13 +22,20 @@ export function cleanModelId(model) {
     .replace(/^models\//, '');
 }
 
-// When the chosen model is overloaded or no longer available, requests retry on this one.
-export function fallbackModel(model) {
-  return cleanModelId(model) === MODELS[1].id ? MODELS[0].id : MODELS[1].id;
+// When the chosen model is overloaded, unavailable, or out of quota, requests move
+// on to these in order. Skipping the chosen one gives three different models a chance.
+export function backupModels(model) {
+  const chosen = cleanModelId(model);
+  return BACKUP_MODELS.filter((id) => id !== chosen).slice(0, 2);
 }
 
+// "gemini-3.6-flash" → "Gemini 3.6 Flash", so backups outside MODELS read well too.
 export function modelLabel(id) {
-  return MODELS.find((m) => m.id === id)?.label ?? id;
+  const model = cleanModelId(id);
+  const known = MODELS.find((m) => m.id === model);
+  if (known) return known.label;
+  const flash = /^gemini-(\d+(?:\.\d+)?)-flash(-lite)?$/.exec(model);
+  return flash ? `Gemini ${flash[1]} Flash${flash[2] ? '-Lite' : ''}` : model;
 }
 
 export const DEFAULT_SETTINGS = {

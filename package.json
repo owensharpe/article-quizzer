@@ -1,6 +1,6 @@
 {
   "name": "article-quizzer",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": true,
   "description": "Chrome extension that quizzes you on the article you're reading.",
   "license": "MIT",

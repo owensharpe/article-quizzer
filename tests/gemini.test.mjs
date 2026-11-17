@@ -1,6 +1,5 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { getEventListeners } from 'node:events';
 import {
   generateJSON,
   testConnection,
@@ -32,14 +31,6 @@ function recorder(...responses) {
 }
 
 const base = { apiKey: 'test-key', system: 'sys', prompt: 'hello', schema };
-
-// Retries wait a few seconds between attempts; skip the waiting in tests.
-function skipDelays(t) {
-  t.mock.method(globalThis, 'setTimeout', (fn) => {
-    queueMicrotask(fn);
-    return 0;
-  });
-}
 
 const overloaded = () =>
   reply(503, { error: { code: 503, status: 'UNAVAILABLE', message: 'The model is overloaded.' } });
@@ -105,45 +96,6 @@ test('generateJSON retries without thinkingLevel when a model rejects it', async
   assert.equal(calls.length, 2);
   assert.ok(calls[0].body.generationConfig.thinkingConfig);
   assert.equal(calls[1].body.generationConfig.thinkingConfig, undefined);
-});
-
-test('generateJSON drops thinkingLevel even when a retry is what gets rejected', async (t) => {
-  skipDelays(t);
-  const { calls, fetchImpl } = recorder(
-    overloaded(),
-    reply(400, { error: { code: 400, message: 'Thinking level is not supported for this model.' } }),
-    textReply('{"ok":true}'),
-  );
-  assert.deepEqual(await generateJSON({ ...base, model: 'gemini-flash-latest', fetchImpl }), { ok: true });
-  assert.deepEqual(
-    calls.map((c) => Boolean(c.body.generationConfig.thinkingConfig)),
-    [true, true, false],
-  );
-});
-
-test('generateJSON retries once on a 503', async (t) => {
-  skipDelays(t);
-  const controller = new AbortController();
-  const { calls, fetchImpl } = recorder(overloaded(), textReply('{"ok":true}'));
-  assert.deepEqual(
-    await generateJSON({ ...base, model: 'gemini-3.8-flash', fetchImpl, signal: controller.signal }),
-    { ok: true },
-  );
-  assert.equal(calls.length, 2);
-  assert.equal(getEventListeners(controller.signal, 'abort').length, 0, 'the wait cleans up after itself');
-});
-
-test('generateJSON stops waiting to retry once the request is cancelled', async (t) => {
-  t.mock.method(globalThis, 'setTimeout', () => 0); // the retry would never come
-  const controller = new AbortController();
-  const fetchImpl = async () => {
-    controller.abort();
-    return overloaded();
-  };
-  await assert.rejects(
-    generateJSON({ ...base, model: 'gemini-3.8-flash', fetchImpl, signal: controller.signal }),
-    { name: 'AbortError' },
-  );
 });
 
 test('generateJSON explains common API errors', async () => {
@@ -309,16 +261,15 @@ test('checkKey rejects only keys Gemini turns down', async () => {
   await assert.rejects(checkKey({ apiKey: 'k', model, fetchImpl: bad.fetchImpl }), { code: 'bad_key' });
 });
 
-test('generateJSON gives up after repeated overloads and keeps what Gemini said', async (t) => {
-  skipDelays(t);
-  const { calls, fetchImpl } = recorder(overloaded(), overloaded(), overloaded());
+test('generateJSON reports an overload at once and keeps what Gemini said', async () => {
+  const { calls, fetchImpl } = recorder(overloaded(), textReply('{"ok":true}'));
   await assert.rejects(generateJSON({ ...base, model: 'gemini-3.8-flash', fetchImpl }), (err) => {
     assert.equal(err.code, 'server');
     assert.match(err.message, /overloaded/);
     assert.equal(err.detail, 'HTTP 503 · UNAVAILABLE · The model is overloaded.');
     return true;
   });
-  assert.equal(calls.length, 3);
+  assert.equal(calls.length, 1, 'retrying is up to the caller');
 });
 
 test('generateJSON explains timeouts separately and does not resend them', async () => {
@@ -330,4 +281,83 @@ test('generateJSON explains timeouts separately and does not resend them', async
     message: /took too long/,
   });
   assert.equal(calls.length, 1);
+});
+
+// Settles after `ms`, unless the request is cancelled or runs out of time first.
+function slowly(init, ms, value) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(resolve, ms, value);
+    init.signal.addEventListener(
+      'abort',
+      () => {
+        clearTimeout(timer);
+        reject(init.signal.reason);
+      },
+      { once: true },
+    );
+  });
+}
+
+test('generateJSON gives up on a model that does not answer in time, without trying it again', async () => {
+  const calls = [];
+  const fetchImpl = (url, init) => {
+    calls.push(url);
+    return slowly(init, 5000, textReply('{"ok":true}'));
+  };
+  await assert.rejects(
+    generateJSON({ ...base, model: 'gemini-3.8-flash', fetchImpl, timeoutMs: 50 }),
+    (err) => {
+      assert.equal(err.code, 'server', 'so another model gets a chance');
+      assert.equal(err.timedOut, true);
+      assert.match(err.detail, /^No response from gemini-3\.8-flash within \d+ seconds$/);
+      return true;
+    },
+  );
+  assert.equal(calls.length, 1);
+});
+
+test('generateJSON also stops waiting for a reply that stalls partway through', async () => {
+  const fetchImpl = async (url, init) => ({ ok: true, status: 200, json: () => slowly(init, 5000, {}) });
+  await assert.rejects(generateJSON({ ...base, model: 'gemini-3.8-flash', fetchImpl, timeoutMs: 50 }), {
+    code: 'server',
+    timedOut: true,
+  });
+});
+
+test('generateJSON gives each attempt 45 seconds, or two minutes with a file attached', async (t) => {
+  const timeout = t.mock.method(AbortSignal, 'timeout');
+  const { fetchImpl } = recorder(textReply('{"ok":true}'), textReply('{"ok":true}'));
+  await generateJSON({ ...base, model: 'gemini-3.8-flash', fetchImpl });
+  const attachments = [{ mimeType: 'application/pdf', data: 'QUJD' }];
+  await generateJSON({ ...base, model: 'gemini-3.8-flash', fetchImpl, attachments });
+  assert.deepEqual(
+    timeout.mock.calls.map((call) => call.arguments[0]),
+    [45_000, 120_000],
+  );
+});
+
+test('a cancel passes through unchanged while the time limit runs', async () => {
+  const controller = new AbortController();
+  const fetchImpl = (url, init) => slowly(init, 5000, textReply('{"ok":true}'));
+  const request = generateJSON({ ...base, model: 'gemini-3.8-flash', fetchImpl, signal: controller.signal });
+  controller.abort();
+  await assert.rejects(request, (err) => {
+    assert.equal(err, controller.signal.reason);
+    return true;
+  });
+});
+
+test('the time limit and cancelling still work without AbortSignal.any', async (t) => {
+  const { any } = AbortSignal;
+  AbortSignal.any = undefined;
+  t.after(() => {
+    AbortSignal.any = any;
+  });
+  const fetchImpl = (url, init) => slowly(init, 5000, textReply('{"ok":true}'));
+  const controller = new AbortController();
+  const request = { ...base, model: 'gemini-3.8-flash', fetchImpl, signal: controller.signal };
+  await assert.rejects(generateJSON({ ...request, timeoutMs: 50 }), { code: 'server', timedOut: true });
+  const cancelled = generateJSON(request);
+  controller.abort();
+  await assert.rejects(cancelled, { name: 'AbortError' });
 });

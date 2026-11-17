@@ -10,7 +10,8 @@ import {
   updateSettings,
   deleteHistoryEntry,
   quizStats,
-  fallbackModel,
+  backupModels,
+  modelLabel,
 } from '../extension/lib/storage.js';
 
 const DAY = 24 * 60 * 60 * 1000;
@@ -107,9 +108,19 @@ test('normalizeUrl keeps hash routes and the query as written', () => {
   assert.equal(normalizeUrl('https://site.com/find?q=a%20b&utm%5Fsource=feed&tags=x,y&ref=home'), key);
 });
 
-test('fallbackModel recognizes ids with the models/ prefix', () => {
-  assert.equal(fallbackModel('gemini-3.8-flash'), 'gemini-3.5-flash-lite');
-  assert.equal(fallbackModel(' models/gemini-3.5-flash-lite'), 'gemini-3.8-flash');
+test('backupModels offers two others, skipping the chosen model even with the models/ prefix', () => {
+  assert.deepEqual(backupModels('gemini-3.8-flash'), ['gemini-3.5-flash-lite', 'gemini-3.6-flash']);
+  assert.deepEqual(backupModels(' models/gemini-3.5-flash-lite'), ['gemini-3.8-flash', 'gemini-3.6-flash']);
+  assert.deepEqual(backupModels('gemini-3.6-flash'), ['gemini-3.8-flash', 'gemini-3.5-flash-lite']);
+  assert.deepEqual(backupModels('gemini-flash-latest'), ['gemini-3.8-flash', 'gemini-3.5-flash-lite']);
+});
+
+test('modelLabel names any Flash model and leaves other ids as they are', () => {
+  assert.equal(modelLabel('gemini-3.5-flash-lite'), 'Gemini 3.5 Flash-Lite');
+  assert.equal(modelLabel('gemini-flash-latest'), 'Gemini Flash (latest)');
+  assert.equal(modelLabel('gemini-3.6-flash'), 'Gemini 3.6 Flash');
+  assert.equal(modelLabel('models/gemini-4.1-flash-lite'), 'Gemini 4.1 Flash-Lite');
+  assert.equal(modelLabel('gemini-3.6-pro-preview'), 'gemini-3.6-pro-preview');
 });
 
 test('settings fall back to defaults and merge updates', async () => {

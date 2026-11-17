@@ -319,24 +319,54 @@ async function main() {
       await panel.click('[aria-label="Exit quiz"]');
     });
 
-    await step('switches to Flash-Lite when the chosen model stays overloaded', async () => {
-      mock.quiz = (url) =>
-        url.includes('gemini-3.8-flash')
-          ? {
-              status: 503,
-              json: { error: { code: 503, status: 'UNAVAILABLE', message: 'The model is overloaded.' } },
-            }
-          : geminiOk(QUIZ);
+    await step('moves through backup models while the chosen one is overloaded, and says so', async () => {
+      const overloaded = {
+        status: 503,
+        json: {
+          error: {
+            code: 503,
+            status: 'UNAVAILABLE',
+            message: 'This model is currently experiencing high demand.',
+          },
+        },
+      };
+      const rateLimited = { status: 429, json: { error: { code: 429, message: 'Resource exhausted' } } };
+      // 3.8 stays busy and Flash-Lite is out of quota; 3.6 is busy once, then answers.
+      let tries36 = 0;
+      mock.quiz = (url) => {
+        if (url.includes('gemini-3.8-flash')) return overloaded;
+        if (url.includes('gemini-3.5-flash-lite')) return rateLimited;
+        return ++tries36 === 1 ? overloaded : geminiOk(QUIZ);
+      };
+      // Each line the loading screen shows, in order.
+      await panel.evaluate(() => {
+        window.statusLines = [];
+        new MutationObserver(() => {
+          const line = document.getElementById('gen-status')?.textContent;
+          if (line && line !== window.statusLines.at(-1)) window.statusLines.push(line);
+        }).observe(document.getElementById('app'), { childList: true, subtree: true });
+      });
       apiCalls.length = 0;
       await clickText(panel, 'Write new questions');
-      await waitForText(panel, 'Question 1 of 5', 20_000);
-      await waitForText(panel, 'was busy, so Gemini 3.5 Flash-Lite wrote this quiz');
+      await waitForText(panel, 'All models are busy. Trying again in');
+      await shot(panel, '10b-models-busy');
+      await waitForText(panel, 'Question 1 of 5');
+      await waitForText(panel, 'Gemini 3.8 Flash was busy, so Gemini 3.6 Flash wrote this quiz.');
+      assert.deepEqual(await panel.evaluate(() => window.statusLines), [
+        'Gemini 3.8 Flash is writing your quiz.',
+        'Gemini 3.8 Flash is busy, so Gemini 3.5 Flash-Lite is trying.',
+        'Gemini 3.5 Flash-Lite hit its free-tier limit, so Gemini 3.6 Flash is trying.',
+        'All models are busy. Trying again in 2 seconds…',
+        'Gemini 3.8 Flash is trying again.',
+        'Gemini 3.8 Flash is busy, so Gemini 3.6 Flash is trying.',
+      ]);
       const models = apiCalls.filter((c) => c.body?.contents).map((c) => /models\/([^:]+):/.exec(c.url)[1]);
       assert.deepEqual(models, [
         'gemini-3.8-flash',
-        'gemini-3.8-flash',
-        'gemini-3.8-flash',
         'gemini-3.5-flash-lite',
+        'gemini-3.6-flash',
+        'gemini-3.8-flash',
+        'gemini-3.6-flash',
       ]);
       await panel.click('[aria-label="Exit quiz"]');
 

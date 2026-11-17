@@ -1,5 +1,5 @@
-import { AIError, generateJSON } from './gemini.js';
-import { fallbackModel, reviewStatus } from './storage.js';
+import { AIError, generateJSON, timeLimit } from './gemini.js';
+import { backupModels, reviewStatus } from './storage.js';
 
 export const COUNTS = [5, 8, 12];
 export const STYLES = [
@@ -187,30 +187,95 @@ export function buildQuizPrompt({
   return lines.join('\n');
 }
 
-// Busy models are common at peak times, and old ones get retired; another model
-// usually works. Returns the reply, the model that wrote it, and why the chosen
-// model was passed over ('server' or 'bad_model'), if it was.
+// Busy models are common at peak times, old ones get retired, and free-tier
+// quotas are per model, so another model usually works. A 504 ('timeout') isn't
+// here: it mostly comes from a long input, which would slow any model.
+const FALLBACK_CODES = new Set(['server', 'bad_model', 'rate_limit']);
+// Overloads come in short spikes. Once every model has failed, the busy ones get
+// another try after about 2, 5, then 10 seconds, jittered so readers don't all
+// retry at once.
+const PASS_DELAYS = [2000, 5000, 10_000];
+// How long one request keeps trying. PDFs take longer to read.
+const TIME_BUDGET_MS = 90_000;
+const FILE_TIME_BUDGET_MS = 150_000;
+// Too little time left to be worth another request.
+const MIN_ATTEMPT_MS = 5000;
+
+// Tries the chosen model, then its backups, moving on at the first failure. If
+// they all fail, tries the busy ones again after a pause, until the time budget
+// runs out. Returns the reply, the model that wrote it, and why the chosen model
+// was passed over ('server', 'bad_model' or 'rate_limit'), if it was.
 async function ask(settings, request, generate = generateJSON) {
-  const run = (model) => generate({ ...request, apiKey: settings.apiKey, model });
-  try {
-    return { data: await run(settings.model), model: settings.model };
-  } catch (err) {
-    if (err?.code !== 'server' && err?.code !== 'bad_model') throw err;
-    const model = fallbackModel(settings.model);
-    try {
-      return { data: await run(model), model, fallbackReason: err.code };
-    } catch (fallbackErr) {
-      if (fallbackErr?.name === 'AbortError') throw fallbackErr;
-      // The chosen model's error is the one the reader can act on.
-      err.detail = [err.detail, `Fallback model ${model}: ${fallbackErr.detail || fallbackErr.message}`]
-        .filter(Boolean)
-        .join(' · ');
-      throw err;
+  const { attachments, signal, onStatus } = request;
+  const deadline = Date.now() + (attachments?.length ? FILE_TIME_BUDGET_MS : TIME_BUDGET_MS);
+  const failures = new Map(); // each model's latest error; the chosen model comes first
+  let models = [settings.model, ...backupModels(settings.model)];
+  for (let pass = 0; ; pass++) {
+    const busy = [];
+    for (const [i, model] of models.entries()) {
+      try {
+        const timeoutMs = Math.min(timeLimit(attachments), deadline - Date.now());
+        const data = await generate({ ...request, apiKey: settings.apiKey, model, timeoutMs });
+        if (model === settings.model) return { data, model };
+        return { data, model, fallbackReason: failures.get(settings.model).code };
+      } catch (err) {
+        if (err?.name === 'AbortError') throw err;
+        failures.set(model, err);
+        if (!FALLBACK_CODES.has(err?.code) || deadline - Date.now() < MIN_ATTEMPT_MS) {
+          throw combinedError(failures);
+        }
+        if (err.code === 'server') busy.push(model);
+        const next = models[i + 1];
+        if (next) onStatus?.({ model, reason: failureReason(err), next });
+      }
     }
+    const base = PASS_DELAYS[Math.min(pass, PASS_DELAYS.length - 1)];
+    const wait = Math.round(base * (0.75 + Math.random() / 2));
+    if (!busy.length || deadline - Date.now() - wait < MIN_ATTEMPT_MS) throw combinedError(failures);
+    onStatus?.({ wait: Math.round(wait / 1000) });
+    await delay(wait, signal);
+    models = busy;
+    onStatus?.({ next: models[0] });
   }
 }
 
-// For PDFs, pass the file as base64 in pdfData instead of text.
+function failureReason(err) {
+  if (err.timedOut) return 'slow';
+  if (err.code === 'rate_limit') return 'quota';
+  return err.code === 'bad_model' ? 'unavailable' : 'busy';
+}
+
+// The chosen model's error is the one the reader can act on. The others go in
+// the small print, once per model.
+function combinedError(failures) {
+  const [[, error], ...others] = failures;
+  const notes = others.map(([model, err]) => `Fallback model ${model}: ${err.detail || err.message}`);
+  error.detail = [error.detail, ...notes].filter(Boolean).join(' · ');
+  return error;
+}
+
+function delay(ms, signal) {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(signal.reason);
+      return;
+    }
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(signal.reason);
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    signal?.addEventListener('abort', onAbort, { once: true });
+  });
+}
+
+// For PDFs, pass the file as base64 in pdfData instead of text. onStatus, if
+// given, hears { model, reason, next } when one model gives way to the next
+// (reason is 'busy', 'slow', 'quota' or 'unavailable'), { wait } with the seconds
+// until every busy model is tried again, and { next } when that try begins.
 export async function generateQuiz({
   article,
   text,
@@ -220,6 +285,7 @@ export async function generateQuiz({
   settings,
   avoid = [],
   signal,
+  onStatus,
 }) {
   const count = clampCount(options.count);
   const pdf = Boolean(pdfData);
@@ -253,6 +319,7 @@ export async function generateQuiz({
       schema: quizSchema(count),
       attachments: pdf ? [{ mimeType: 'application/pdf', data: pdfData }] : [],
       signal,
+      onStatus,
     },
     generate,
   );

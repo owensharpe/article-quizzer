@@ -44,7 +44,7 @@ The extension reads a page only when you invoke it there. If you move to a diffe
 
 Gemini has a free tier that needs no credit card, a context window big enough for whole articles and PDFs, and it can be held to a JSON schema, so quizzes come back in a consistent shape.
 
-The default model is `gemini-3.8-flash`. In settings you can switch to `gemini-3.5-flash-lite` (faster, with higher free-tier limits) or enter any other Gemini model ID. If the chosen model is overloaded, the extension retries and then switches to the other one for that request. If you hit the free tier's rate limit, wait a minute or switch to Flash-Lite.
+The default model is `gemini-3.8-flash`. In settings you can switch to `gemini-3.5-flash-lite` (faster, with higher free-tier limits) or enter any other Gemini model ID. If the chosen model is overloaded, doesn't answer within 45 seconds (two minutes for a PDF), is no longer available, or has hit its free-tier rate limit, the request moves straight on to a backup model: two of `gemini-3.8-flash`, `gemini-3.5-flash-lite`, and `gemini-3.6-flash`, in that order, skipping the one you chose. Overloads usually pass within seconds, so when every model has failed, the extension pauses (about 2 seconds, then 5, then 10) and tries the busy ones again, giving up after 90 seconds in all (two and a half minutes for a PDF). The loading screen shows which model is working.
 
 ## Privacy
 
